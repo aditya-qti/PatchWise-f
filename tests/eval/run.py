@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .bug_commits import BUG_COMMITS, BUG_TO_FIXES, BUG_COMMITS_2, BUG_TO_FIXES_2
+from .deepreview_convert import convert_deepreview_to_issues
 from .fixes import load_fix_commits, load_fix_diff
 from .judge import judge_matches_batch
 from .match import Match, match_issues_to_fixes
@@ -28,6 +29,7 @@ from .match_chroma import match_issues_to_db
 from .parse import Issue, parse_issues
 from .report import BugResult, generate_report
 from .run_aicodereview import run_aicodereview
+from .run_deepreview import run_deepreview
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +69,13 @@ def run_pipeline(
     bug_to_fixes: dict[str, list[str]] | None = None,
     use_chroma_db: bool = False,
     chroma_path: Path | None = None,
+    deep_review: bool = False,
+    converter_model: str | None = None,
+    converter_provider: str | None = None,
 ) -> Path:
     if output_dir is None:
-        logger.info("Output directory: %s", output_dir)
+        output_dir = _make_output_dir(patchwise_model)
+    logger.info("Output directory: %s", output_dir)
 
     if bug_commits is None:
         bug_commits = BUG_COMMITS
@@ -83,6 +89,17 @@ def run_pipeline(
             "LLM judge is enabled but --judge-model is not set. "
             "Pass --judge-model (and usually --judge-provider) explicitly, "
             "or pass --no-judge to fall back to similarity-threshold matching."
+        )
+
+    # The DeepReview path needs an auxiliary LLM to normalize its HTML report
+    # into parseable issues. Default to the judge model/provider when not set.
+    effective_converter_model = converter_model or judge_model
+    effective_converter_provider = converter_provider or judge_provider
+    if deep_review and not effective_converter_model:
+        raise RuntimeError(
+            "--deep-review needs an LLM to convert DeepReview output into issues. "
+            "Pass --converter-model (and usually --converter-provider), or set "
+            "--judge-model which the converter falls back to."
         )
     if reviews_dir is None and shutil.which("docker") is None:
         raise RuntimeError("docker not found on PATH (required when --reviews-dir is not set)")
@@ -104,6 +121,8 @@ def run_pipeline(
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     judge_cache_dir = output_dir / "judge"
     judge_cache_dir.mkdir(parents=True, exist_ok=True)
+    convert_cache_dir = output_dir / "convert"
+    convert_cache_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     head_result = subprocess.run(
@@ -117,12 +136,24 @@ def run_pipeline(
     fixes_by_bug = load_fix_commits(bug_to_fixes, kernel_path)
 
     results = []
+    review_basename = "deepreview.txt" if deep_review else "aicodereview.txt"
     for bug_sha in bug_commits:
         if reviews_dir is not None:
-            review_file = reviews_dir / bug_sha / "aicodereview.txt"
+            review_file: Path | None = reviews_dir / bug_sha / review_basename
             if not review_file.exists():
                 logger.warning("No review file for %s at %s, skipping", bug_sha[:12], review_file)
                 continue
+        elif deep_review:
+            deep_reviews_dir = output_dir / "deep_reviews"
+            deep_reviews_dir.mkdir(parents=True, exist_ok=True)
+            review_file = run_deepreview(
+                bug_sha,
+                kernel_path=kernel_path,
+                output_dir=deep_reviews_dir,
+                force=force_rerun,
+                model=patchwise_model,
+                provider=patchwise_provider,
+            )
         else:
             ai_reviews_dir = output_dir / "ai_reviews"
             ai_reviews_dir.mkdir(parents=True, exist_ok=True)
@@ -135,7 +166,15 @@ def run_pipeline(
                 provider=patchwise_provider,
             )
 
-        issues = parse_issues(review_file)
+        if deep_review:
+            issues = convert_deepreview_to_issues(
+                review_file,
+                model=effective_converter_model,
+                api_base=effective_converter_provider,
+                cache_dir=convert_cache_dir,
+            )
+        else:
+            issues = parse_issues(review_file)
         print(f"\nProcessing {bug_sha}:\n", flush=True)
         if issues:
             print("Issues:\n", flush=True)
@@ -296,7 +335,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--model", default=None, help="--model passed to patchwise AiCodeReview")
     p.add_argument("--provider", default=None, help="--provider passed to patchwise AiCodeReview")
     p.add_argument("--reviews-dir", type=Path, default=None,
-                   help="use existing aicodereview.txt files instead of running patchwise")
+                   help="use existing review .txt files instead of running patchwise "
+                        "(aicodereview.txt, or deepreview.txt with --deep-review)")
+    p.add_argument("--deep-review", action="store_true",
+                   help="run patchwise --deep-review (DeepReview) instead of AiCodeReview; "
+                        "its HTML output is converted to issues via --converter-model")
+    p.add_argument("--converter-model", default=None,
+                   help="LLM that converts DeepReview output into issues "
+                        "(default: --judge-model)")
+    p.add_argument("--converter-provider", default=None,
+                   help="api_base for the converter LLM (default: --judge-provider)")
     p.add_argument("--no-judge", action="store_true",
                    help="skip LLM-as-judge; report uses only similarity threshold")
     p.add_argument("--judge-model", default=None,
@@ -325,6 +373,9 @@ if __name__ == "__main__":
             judge_enabled=not args.no_judge,
             judge_model=args.judge_model,
             judge_provider=args.judge_provider,
+            deep_review=args.deep_review,
+            converter_model=args.converter_model,
+            converter_provider=args.converter_provider,
         )
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)

@@ -66,6 +66,9 @@ def test_eval_pipeline_2(request: pytest.FixtureRequest) -> None:
     judge_enabled = os.environ.get("PATCHWISE_EVAL_DISABLE_JUDGE") != "1"
     judge_model = os.environ.get("PATCHWISE_EVAL_JUDGE_MODEL")
     judge_provider = os.environ.get("PATCHWISE_EVAL_JUDGE_PROVIDER")
+    deep_review = bool(request.config.getoption("--deep-review")) or os.environ.get("PATCHWISE_EVAL_DEEP_REVIEW") == "1"
+    converter_model = request.config.getoption("--converter-model") or os.environ.get("PATCHWISE_EVAL_CONVERTER_MODEL")
+    converter_provider = request.config.getoption("--converter-provider") or os.environ.get("PATCHWISE_EVAL_CONVERTER_PROVIDER")
 
     try:
         actual_output_dir = run_pipeline(
@@ -87,6 +90,9 @@ def test_eval_pipeline_2(request: pytest.FixtureRequest) -> None:
             bug_to_fixes=BUG_TO_FIXES_2,
             use_chroma_db=True,
             chroma_path=chroma_path,
+            deep_review=deep_review,
+            converter_model=converter_model,
+            converter_provider=converter_provider,
         )
     except RuntimeError as e:
         pytest.skip(str(e))
@@ -121,6 +127,9 @@ if __name__ == "__main__":
             bug_to_fixes=BUG_TO_FIXES_2,
             use_chroma_db=True,
             chroma_path=_DEFAULT_CHROMA_PATH,
+            deep_review=args.deep_review,
+            converter_model=args.converter_model,
+            converter_provider=args.converter_provider,
         )
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
